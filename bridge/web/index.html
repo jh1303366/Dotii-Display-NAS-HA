@@ -39,6 +39,10 @@
         <span>Bambu</span>
         <span class="module-meta" id="bambu-nav-state">读取中</span>
       </button>
+      <button class="module-tab" type="button" data-panel="ha" aria-selected="false">
+        <span class="ha-logo" aria-hidden="true">⌂</span><span>Home Assistant</span>
+        <span class="module-meta" id="ha-nav-state">读取中</span>
+      </button>
       <button class="module-tab" type="button" data-panel="custom" aria-selected="false">
         <span class="nav-icon custom-icon" aria-hidden="true"></span>
         <span>自定义</span>
@@ -73,7 +77,7 @@
                   <div class="usage-ring-inner">
                     <span>5 小时剩余</span>
                     <strong id="five-hour-value">--</strong>
-                    <small id="five-hour-plan">仅 Plus</small>
+                    <small id="five-hour-plan">接口未提供</small>
                   </div>
                 </div>
                 <p class="quota-reset"><span>重置时间</span><strong id="five-hour-reset-date">--</strong></p>
@@ -143,7 +147,7 @@
 
         <section class="module-preferences codex-preferences" aria-labelledby="codex-preferences-heading">
           <div class="module-preferences-heading">
-            <div><h3 id="codex-preferences-heading">Codex 设置</h3><p>管理 Dotii 上的 Codex 页面和电脑端数据连接。</p></div>
+            <div><h3 id="codex-preferences-heading">Codex 设置</h3><p>管理 Dotii 上的 Codex 页面与额度查询。</p></div>
             <label class="module-switch">
               <span>启用功能</span>
               <input id="codex-enabled" type="checkbox">
@@ -156,7 +160,7 @@
                 <h3>Codex 页面样式</h3>
                 <p>选择 Dotii 和 Dotii 管理中心中显示的剩余额度。</p>
               </div>
-              <span class="subscription-badge">仅 Plus 订阅有 5 小时限额</span>
+              <span class="subscription-badge">额度窗口以账号实际返回为准</span>
             </div>
             <div class="codex-ui-setting">
               <span class="time-field-label" id="codex-ui-label">Dotii 主页面</span>
@@ -191,8 +195,12 @@
               <div><span>额度与用量</span><strong id="codex-check-usage">--</strong></div>
               <div><span>任务列表</span><strong id="codex-check-threads">--</strong></div>
             </div>
+            <p class="dependency-status" id="codex-auth-detail" hidden></p>
+            <p id="codex-auth-code-row" hidden>授权验证码：<strong id="codex-auth-code"></strong> · <a id="codex-auth-link" target="_blank" rel="noopener noreferrer">打开官方授权页</a></p>
             <p class="dependency-status" id="codex-check-detail" role="status" aria-live="polite">启用 Codex 后可运行只读检测。</p>
             <div class="dependency-actions codex-check-actions">
+              <button class="quiet-button" id="codex-login" hidden>登录 / 重新登录 Codex</button>
+              <button class="quiet-button" id="codex-login-cancel" hidden>取消登录</button>
               <button class="primary-button" id="codex-check" type="button">开始检测</button>
               <time id="codex-check-time">尚未检测</time>
             </div>
@@ -262,6 +270,26 @@
         </section>
       </section>
 
+      <section class="panel" id="panel-ha" aria-labelledby="ha-heading" hidden>
+        <div class="section-heading"><div><h2 id="ha-heading">Home Assistant</h2><p>家里的温度、空调和灯光，抬手就能查看和控制。</p></div>
+          <label class="module-switch"><span>屏幕页面</span><input id="ha-enabled" type="checkbox"><span class="switch-track" aria-hidden="true"></span></label></div>
+        <div id="ha-content" class="ha-layout">
+          <article class="ha-preview-panel"><div class="ha-screen" id="ha-screen" aria-label="466×466 圆形屏幕，点击卡片控制设备"></div>
+            <p id="ha-note" role="status">正在读取设备状态</p><small>圆屏预览 · 灯光点击开关 · 空调点击调节 · 左右翻页</small></article>
+          <div class="ha-settings">
+            <form id="ha-form" class="dependency-panel"><h3>连接 Home Assistant</h3>
+              <label>访问地址<input id="ha-url" type="url" placeholder="http://192.168.1.12:8123" required></label>
+              <label>长期访问令牌<input id="ha-token" type="password" autocomplete="new-password" placeholder="已保存时留空即可"></label>
+              <p class="field-hint">在 HA 个人资料中创建长期访问令牌。令牌只保存在 NAS，不发送到屏幕。</p>
+              <button class="primary-button" type="submit">保存连接</button><button class="quiet-button" type="button" id="ha-discover">查找设备</button>
+            </form>
+            <article class="dependency-panel"><h3>屏幕卡片</h3><p>最多 32 张卡片，每页 4 张。名称最多 10 个字。</p>
+              <div class="ha-add"><select id="ha-entity-select" aria-label="选择 HA 设备"><option value="">先查找设备</option></select><button id="ha-add" type="button" class="quiet-button">添加</button></div>
+              <div id="ha-entities"></div><button id="ha-save-entities" type="button" class="primary-button">保存卡片</button>
+            </article>
+          </div>
+        </div>
+      </section>
       <section class="panel" id="panel-custom" aria-labelledby="custom-heading" hidden>
         <div class="section-heading">
           <div>
@@ -618,6 +646,8 @@
                 </div>
               </div>
               <div class="bambu-fields settings-bambu-fields bluetooth-fields">
+                <label><span>NAS 快照地址（可选）</span><input id="bluetooth-target-url" type="url" maxlength="255" placeholder="http://NAS局域网IP:8787/api/v1/snapshot"></label>
+                <label><span>NAS 设备令牌（可选）</span><input id="bluetooth-target-token" type="password" maxlength="64" autocomplete="off" placeholder="从 NAS 管理中心设置页复制；留空则连接本机"></label>
                 <label><span>Wi-Fi 名称</span><input id="bluetooth-ssid" maxlength="32" autocomplete="off" placeholder="Dotii 要连接的 2.4 GHz 网络"></label>
                 <label><span>Wi-Fi 密码</span><input id="bluetooth-password" type="password" maxlength="64" autocomplete="new-password" placeholder="只发送给所选 Dotii"></label>
               </div>
@@ -706,5 +736,6 @@
     <strong>Dotii 暂时无法连接</strong>
     <span>请稍后刷新，或从系统托盘重新打开 Dotii。</span>
   </div>
+  <script src="/ha.js" defer></script>
 </body>
 </html>

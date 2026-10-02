@@ -1048,6 +1048,7 @@ function renderCodexTaskSwitcher(tasks) {
 }
 
 function renderOverview(overview) {
+  window.renderHA?.(overview);
   state.overview = overview;
   if (!state.codexChecking && overview.codex_check) state.codexCheck = overview.codex_check;
   const snapshot = overview.snapshot || {};
@@ -1069,18 +1070,20 @@ function renderOverview(overview) {
   const fiveHour = fiveHourAvailable ? Math.max(0, Math.min(100, Number(codex.five_hour_remaining_percent) || 0)) : 0;
 
   setBridgeState(bridge);
+  renderCodexAuth(overview.codex_auth || {});
   renderBluetooth(overview.bluetooth || {});
   renderFirmware(overview.firmware || {});
   byId("usage-ring").style.setProperty("--progress", `${weekly * 3.6}deg`);
   byId("five-hour-ring").style.setProperty("--progress", `${fiveHour * 3.6}deg`);
   setText("weekly-value", weeklyAvailable ? `${weekly}%` : "--");
   setText("five-hour-value", fiveHourAvailable ? `${fiveHour}%` : "--");
-  setText("five-hour-plan", fiveHourAvailable ? "Plus 计划" : "仅 Plus");
+  setText("five-hour-plan", fiveHourAvailable ? "5 小时额度" : "接口未提供");
   setText("five-hour-reset-date", fiveHourAvailable ? (codex.five_hour_reset_date || "--") : "--");
   setText("weekly-reset-inline-value", codex.reset_date || "--");
   setText("weekly-plan", codex.plan_type ? `${codex.plan_type} 计划` : "计划类型未知");
-  setText("snapshot-source", snapshot.preview_data ? "示例内容" : bridge.collector_state === "online" ? "已连接" : "等待连接");
-  setText("snapshot-time", formatTime(snapshot.generated_at_epoch));
+  const quotaStale = codex.account_stale || (codex.account_updated_at_epoch && Date.now() / 1000 - codex.account_updated_at_epoch > 120);
+  setText("snapshot-source", snapshot.preview_data ? "示例内容" : quotaStale ? "额度暂未更新" : bridge.collector_state === "online" ? "已连接" : "等待连接");
+  setText("snapshot-time", formatTime(codex.account_updated_at_epoch || snapshot.generated_at_epoch));
   setText("weekly-tokens", formatNumber(codex.weekly_tokens, codex.weekly_tokens_available !== false));
   setText("weekly-token-period", codex.weekly_tokens_available !== false && codex.weekly_tokens_as_of
     ? `统计截至 ${codex.weekly_tokens_as_of}`
@@ -1184,7 +1187,7 @@ function renderCodexCheck(result, enabled = true, liveBridge = {}) {
   setText("codex-check-account", account.logged_in ? (account.email || "已登录") : "未登录");
   setText("codex-check-plan", account.plan_type ? account.plan_type.toUpperCase() : "--");
   setText("codex-check-usage", account.logged_in ? `额度${checkText(checks.rate_limits)} · 用量${checkText(checks.usage)}` : "--");
-  setText("codex-check-threads", checks.threads ? `正常 · ${Number(result.thread_count) || 0} 个` : "异常");
+  setText("codex-check-threads", result.quota_only ? "NAS 仅采集额度" : checks.threads ? `正常 · ${Number(result.thread_count) || 0} 个` : "异常");
   setText("codex-check-detail", result.detail || (result.ok ? "Codex 功能运行正常。" : "Codex 功能检测异常。"));
   setText("codex-check-time", result.checked_at_epoch ? `检测于 ${formatTime(result.checked_at_epoch)}` : "尚未检测");
 }
@@ -1434,6 +1437,8 @@ async function configureBluetooth() {
   try {
     await bluetoothAction("/api/v1/admin/bluetooth/configure", {
       address, ssid, password,
+      target_bridge_url: byId("bluetooth-target-url").value.trim(),
+      target_bridge_token: byId("bluetooth-target-token").value.trim(),
     });
     byId("bluetooth-password").value = "";
     showToast("正在通过蓝牙配置 Dotii");
@@ -1848,3 +1853,30 @@ setupUiSelects();
 loadDotiiExpressions();
 refreshOverview();
 window.setInterval(refreshOverview, 3000);
+
+function renderCodexAuth(auth) {
+  const visible = auth.available === true;
+  const busy = ["starting", "waiting"].includes(auth.state);
+  byId("codex-login").hidden = !visible;
+  byId("codex-login").disabled = busy;
+  byId("codex-login-cancel").hidden = !visible || !busy;
+  byId("codex-auth-detail").hidden = !visible;
+  setText("codex-auth-detail", auth.detail || "在 NAS 登录 Codex 后可独立读取额度。");
+  const waiting = auth.state === "waiting" && auth.user_code && auth.verification_url;
+  byId("codex-auth-code-row").hidden = !waiting;
+  setText("codex-auth-code", waiting ? auth.user_code : "");
+  byId("codex-auth-link").href = waiting ? auth.verification_url : "#";
+}
+async function codexLoginAction(cancel = false) {
+  try {
+    const response = await fetch(cancel ? "/api/v1/admin/codex/login/cancel" : "/api/v1/admin/codex/login", {
+      method: "POST", headers: {"Content-Type": "application/json"}, body: "{}",
+    });
+    const result = await response.json();
+    if (!response.ok) throw new Error(result.error || "登录操作正在进行，请稍后重试");
+    renderCodexAuth(result.codex_auth || {});
+    await refreshOverview();
+  } catch (error) { showToast(error.message || "无法启动账号登录"); }
+}
+byId("codex-login").addEventListener("click", () => codexLoginAction());
+byId("codex-login-cancel").addEventListener("click", () => codexLoginAction(true));

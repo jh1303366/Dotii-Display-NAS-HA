@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
-"""LAN bridge and loopback-only management UI for Dotii.
+"""LAN bridge with local desktop or authenticated NAS management UI for Dotii.
 
 The ESP32-facing schema v1 endpoint is intentionally kept compatible with the
-current firmware. Administrative data and static UI assets are only available
-from the local computer.
+current firmware. Administrative data and static UI assets require local access, or browser
+credentials when DOTII_ADMIN_PASSWORD is configured.
 """
 
 from __future__ import annotations
 
 import argparse
+import base64
+import signal
 import hashlib
 import ipaddress
 import json
@@ -30,8 +32,10 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import unquote, urlparse
 
-from codex_app_server import probe_app_server, run_collector
+from codex_app_server import probe_app_server, run_collector, account_snapshot, thread_snapshot
+from codex_auth import CodexAuthService
 from bambu_client import BambuConfigStore, BambuService
+from ha_client import HAConfigStore, HAService
 from bluetooth_bridge import BluetoothBridge
 from firmware_flasher import FirmwareFlasher
 from platforms import current_platform
@@ -78,7 +82,7 @@ CUSTOM_DEFAULTS = {
     "ring_start": "#F2C66D",
     "ring_end": "#5DA9FF",
 }
-MODULE_DEFAULTS = {"codex": False, "bambu": False, "dotii": True}
+MODULE_DEFAULTS = {"codex": False, "bambu": False, "dotii": True, "ha": False}
 
 
 def resolve_ffmpeg(runtime_folder: Path) -> str | None:
@@ -742,6 +746,8 @@ def validate_snapshot(payload: Any) -> dict[str, Any]:
         "preview_data": bool(payload.get("preview_data", False)),
         "source": _bounded_text(payload.get("source", "manual"), 32, "source"),
         "codex": {
+            "account_updated_at_epoch": _non_negative_int(codex.get("account_updated_at_epoch", 0), "account_updated_at_epoch"),
+            "account_stale": bool(codex.get("account_stale", False)),
             "five_hour_available": bool(codex.get("five_hour_available", False)),
             "five_hour_remaining_percent": five_hour,
             "five_hour_reset_date": _bounded_text(
@@ -1068,11 +1074,18 @@ class BridgeHandler(BaseHTTPRequestHandler):
         return secrets.compare_digest(self.headers.get("X-Bridge-Token", ""), self.bridge.token)
 
     def _local_admin(self) -> bool:
+        password = os.environ.get("DOTII_ADMIN_PASSWORD", "")
+        if password:
+            user = os.environ.get("DOTII_ADMIN_USER", "admin")
+            expected = "Basic " + base64.b64encode(f"{user}:{password}".encode("utf-8")).decode("ascii")
+            return secrets.compare_digest(self.headers.get("Authorization", ""), expected)
         return _is_loopback(self.client_address[0])
 
     def _send_bytes(self, status: int, body: bytes, content_type: str) -> None:
         try:
             self.send_response(status)
+            if getattr(self, "_admin_challenge", False):
+                self.send_header("WWW-Authenticate", 'Basic realm="Dotii", charset="UTF-8"')
             self.send_header("Content-Type", content_type)
             self.send_header("Content-Length", str(len(body)))
             self.send_header("Cache-Control", "no-store")
@@ -1094,7 +1107,11 @@ class BridgeHandler(BaseHTTPRequestHandler):
     def _deny_nonlocal(self) -> bool:
         if self._local_admin():
             return False
-        self._send_json(HTTPStatus.FORBIDDEN, {"error": "management interface is local only"})
+        if os.environ.get("DOTII_ADMIN_PASSWORD"):
+            self._admin_challenge = True
+            self._send_json(HTTPStatus.UNAUTHORIZED, {"error": "management login required"})
+        else:
+            self._send_json(HTTPStatus.FORBIDDEN, {"error": "management interface is local only"})
         return True
 
     def _read_json(self) -> Any:
@@ -1148,7 +1165,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
             "bridge": {
                 "online": True,
                 "local_url": f"http://127.0.0.1:{self.bridge.server_port}",
-                "device_url": f"http://{address}:{self.bridge.server_port}/api/v1/snapshot",
+                "device_url": device_snapshot_url(self.bridge.server_port),
                 "token": self.bridge.token,
                 "port": self.bridge.server_port,
                 "auto_start": startup_enabled(),
@@ -1156,15 +1173,19 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 **runtime,
             },
             "snapshot": snapshot,
+            "codex_auth": self.bridge.codex_auth.snapshot() if self.bridge.codex_auth else {},
+            "codex_quota_only": os.environ.get("DOTII_CODEX_QUOTA_ONLY") == "1",
             "codex_check": self.bridge.codex_check.read(),
             "dotii_config": self.bridge.dotii.read(),
             "display_config": self.bridge.display.read(),
             "bambu_config": self.bridge.bambu_config.public(),
+            "ha_config": self.bridge.ha_config.public() if self.bridge.ha_config else {},
             "bluetooth": self.bridge.bluetooth.snapshot(),
             "firmware": self.bridge.firmware.snapshot(),
             "modules": [
                 {"id": "codex", "name": "Codex", "enabled": snapshot["modules"]["codex"], "available": True, "locked": False},
                 {"id": "bambu", "name": "Bambu", "enabled": snapshot["modules"]["bambu"], "available": True, "locked": False},
+                {"id": "ha", "name": "Home Assistant", "enabled": snapshot["modules"]["ha"], "available": True, "locked": False},
                 {"id": "custom", "name": "自定义", "enabled": snapshot["custom"]["enabled"], "available": True, "locked": False},
                 {"id": "dotii", "name": "Dotii", "enabled": snapshot["modules"]["dotii"], "available": True, "locked": False},
             ],
@@ -1193,6 +1214,15 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 self._send_json(HTTPStatus.OK, self._overview())
             except (OSError, ValueError, json.JSONDecodeError) as error:
                 self._send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(error)})
+        elif path == "/api/v1/admin/ha/entities":
+            if self._deny_nonlocal():
+                return
+            try:
+                if self.bridge.ha is None:
+                    raise ValueError("HA 服务未启动")
+                self._send_json(HTTPStatus.OK, {"entities": self.bridge.ha.discover()})
+            except (OSError, ValueError) as error:
+                self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(error)})
         elif path == "/api/v1/admin/custom/source":
             if self._deny_nonlocal():
                 return
@@ -1233,6 +1263,48 @@ class BridgeHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:  # noqa: N802
         path = urlparse(self.path).path
+        if path in {"/api/v1/admin/ha/config", "/api/v1/admin/ha/refresh", "/api/v1/admin/ha/command", "/api/v1/ha/command"}:
+            if path.startswith("/api/v1/admin/"):
+                if self._deny_nonlocal():
+                    return
+            elif not self._authorized():
+                self._send_json(HTTPStatus.UNAUTHORIZED, {"error": "invalid bridge token"})
+                return
+            try:
+                if self.bridge.ha is None:
+                    raise ValueError("HA 服务未启动")
+                payload = self._read_admin_action()
+                if path.endswith("/config"):
+                    with self.bridge.ha.io_lock:
+                        config = self.bridge.ha_config.write(payload)
+                    self.bridge.ha.wake.set()
+                    result = {"ok": True, "ha_config": config}
+                elif path.endswith("/refresh"):
+                    self.bridge.ha.refresh()
+                    result = {"ok": True, "ha": self.bridge.ha.snapshot()}
+                else:
+                    result = self.bridge.ha.command(payload)
+                self._send_json(HTTPStatus.OK, result)
+            except (OSError, ValueError, UnicodeError) as error:
+                self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(error)})
+            return
+        if path in {"/api/v1/admin/codex/login", "/api/v1/admin/codex/login/cancel"}:
+            if self._deny_nonlocal():
+                return
+            try:
+                self._read_admin_action()
+                if self.bridge.codex_auth is None:
+                    raise ValueError("当前运行模式未启用网页登录")
+                if path.endswith("/cancel"):
+                    self.bridge.codex_auth.cancel()
+                    started = True
+                else:
+                    started = self.bridge.codex_auth.start(login=True)
+                self._send_json(HTTPStatus.ACCEPTED if started else HTTPStatus.CONFLICT,
+                                {"ok": started, "codex_auth": self.bridge.codex_auth.snapshot()})
+            except (OSError, ValueError, json.JSONDecodeError) as error:
+                self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(error)})
+            return
         if path == "/api/v1/admin/codex/check":
             if self._deny_nonlocal():
                 return
@@ -1279,11 +1351,14 @@ class BridgeHandler(BaseHTTPRequestHandler):
             try:
                 payload = self._read_admin_action()
                 address = local_ipv4()
-                bridge_url = f"http://{address}:{self.bridge.server_port}/api/v1/snapshot"
+                bridge_url = payload.get("target_bridge_url") or device_snapshot_url(self.bridge.server_port)
+                bridge_token = payload.get("target_bridge_token") or self.bridge.token
+                if bool(payload.get("target_bridge_url")) != bool(payload.get("target_bridge_token")):
+                    raise ValueError("连接 NAS 时请同时填写 NAS 快照地址和设备令牌")
                 started = self.bridge.bluetooth.start_configure(
                     address=payload.get("address"), ssid=payload.get("ssid"),
                     password=payload.get("password"), bridge_url=bridge_url,
-                    bridge_token=self.bridge.token,
+                    bridge_token=bridge_token,
                     current_token=payload.get("current_token", ""),
                 )
                 status = HTTPStatus.ACCEPTED if started else HTTPStatus.CONFLICT
@@ -1405,7 +1480,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 module_id = payload.get("id")
                 enabled = payload.get("enabled")
                 if module_id not in MODULE_DEFAULTS or not isinstance(enabled, bool):
-                    raise ValueError("id must be codex, bambu or dotii and enabled must be boolean")
+                    raise ValueError("id must be codex, bambu, dotii or ha and enabled must be boolean")
                 modules = self.bridge.modules.read()
                 candidate = {**modules, module_id: enabled}
                 if not any(candidate.values()) and not self.bridge.custom.read()["enabled"]:
@@ -1418,6 +1493,8 @@ class BridgeHandler(BaseHTTPRequestHandler):
                         self.bridge.runtime.report("disabled", "Codex 模块已关闭")
                 elif module_id == "bambu":
                     self.bridge.bambu.set_enabled(enabled)
+                elif module_id == "ha" and self.bridge.ha:
+                    self.bridge.ha.wake.set()
                 self._send_json(HTTPStatus.OK, {"ok": True, "modules": saved})
             except (OSError, ValueError, UnicodeDecodeError, json.JSONDecodeError) as error:
                 self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(error)})
@@ -1520,9 +1597,17 @@ class BridgeServer(ThreadingHTTPServer):
         self.application_folder = application_folder
         self.codex_command = codex_command
         self.host_parent_pid = host_parent_pid
+        self.codex_auth = None
+        self.ha_config = None
+        self.ha = None
 
     def snapshot(self) -> dict[str, Any]:
         snapshot = self.store.read()
+        if os.environ.get("DOTII_CODEX_QUOTA_ONLY") == "1":
+            codex = snapshot["codex"]
+            age = int(time.time()) - codex.get("account_updated_at_epoch", 0)
+            if age > 120 or self.runtime.snapshot()["collector_state"] == "error":
+                codex["account_stale"] = True
         custom = self.custom.read()
         custom.update(self.assets.source_info())
         custom.update(self.assets.render_info())
@@ -1533,8 +1618,19 @@ class BridgeServer(ThreadingHTTPServer):
         snapshot["dotii"] = dotii_state(
             snapshot, snapshot["bambu"], modules["dotii"], self.dotii.read()
         )
+        snapshot["ha"] = self.ha.snapshot() if self.ha else {"connected": False, "revision": 0, "entities": []}
         snapshot["display"] = self.display.read()
         return snapshot
+
+
+def device_snapshot_url(port: int) -> str:
+    base = os.environ.get("DOTII_PUBLIC_URL", "").rstrip("/")
+    if base:
+        parsed = urlparse(base)
+        if parsed.scheme not in {"http", "https"} or not parsed.hostname or parsed.username or parsed.password or parsed.query or parsed.fragment or parsed.path:
+            raise ValueError("DOTII_PUBLIC_URL 必须是 NAS 的完整地址，例如 http://192.168.1.10:8787")
+        return base + "/api/v1/snapshot"
+    return f"http://{local_ipv4()}:{port}/api/v1/snapshot"
 
 
 def main() -> None:
@@ -1548,6 +1644,7 @@ def main() -> None:
     parser.add_argument("--app-server-interval", type=float, default=2.0)
     parser.add_argument("--parent-pid", type=int, default=0, help=argparse.SUPPRESS)
     arguments = parser.parse_args()
+    device_snapshot_url(arguments.port)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     # Preserve the user's enabled/disabled choice while repairing stale paths
     # and releases that incorrectly registered DotiiBridge.exe as the login app.
@@ -1564,6 +1661,11 @@ def main() -> None:
 
     token = arguments.token or load_or_create_token(writable_root / "bridge-token")
     store = StateStore(state_path)
+    if os.environ.get("DOTII_CODEX_QUOTA_ONLY") == "1" and store.read().get("preview_data"):
+        blank = account_snapshot({}, {})
+        task = thread_snapshot(None)
+        blank.update(task=task, tasks=[task])
+        store.write(validate_snapshot({"schema_version": 1, "generated_at_epoch": 0, "preview_data": False, "source": "waiting_login", "codex": blank}))
     runtime = RuntimeStatus()
     stop = threading.Event()
     collector_restart = threading.Event()
@@ -1587,6 +1689,12 @@ def main() -> None:
                           custom, modules, dotii, display, codex_check, assets, bambu_config, bambu,
                           bluetooth, firmware, writable_root, application_root(), arguments.codex_command,
                           arguments.parent_pid)
+    server.ha_config = HAConfigStore(writable_root / "ha.json")
+    server.ha = HAService(server.ha_config, lambda: modules.read()["ha"])
+    server.ha.start()
+    if current_platform().name == "linux":
+        server.codex_auth = CodexAuthService(writable_root, application_root(), arguments.codex_command, collector_restart.set)
+        server.codex_auth.start(login=False)
     if arguments.parent_pid > 1:
         threading.Thread(
             target=watch_parent,
@@ -1614,15 +1722,23 @@ def main() -> None:
     else:
         runtime.report("disabled", "自动数据源未启用")
 
-    address = local_ipv4()
+    def terminate(signum, frame):
+        stop.set()
+        threading.Thread(target=server.shutdown, daemon=True).start()
+
+    signal.signal(signal.SIGTERM, terminate)
     logging.info("Dotii 管理中心：http://127.0.0.1:%s", arguments.port)
-    logging.info("ESP32 地址：http://%s:%s/api/v1/snapshot", address, arguments.port)
+    logging.info("ESP32 地址：%s", device_snapshot_url(arguments.port))
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         pass
     finally:
         stop.set()
+        server.ha.stop.set()
+        server.ha.wake.set()
+        if server.codex_auth is not None:
+            server.codex_auth.stop()
         bambu.stop()
         bluetooth.stop()
         firmware.stop()

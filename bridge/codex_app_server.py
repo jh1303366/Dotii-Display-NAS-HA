@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import queue
 import shutil
@@ -28,7 +29,8 @@ class AppServerError(RuntimeError):
 
 def _as_number(value: Any) -> float | None:
     if isinstance(value, (int, float)) and not isinstance(value, bool):
-        return float(value)
+        number = float(value)
+        return number if math.isfinite(number) else None
     return None
 
 
@@ -147,7 +149,7 @@ class AppServerClient:
         self._write_lock = threading.Lock()
         self._pending_lock = threading.Lock()
         self._pending: dict[int, queue.Queue[dict[str, Any]]] = {}
-        self.notifications: queue.Queue[dict[str, Any]] = queue.Queue()
+        self.notifications: queue.Queue[dict[str, Any]] = queue.Queue(maxsize=256)
         self._closed = threading.Event()
 
     def start(self) -> None:
@@ -193,7 +195,18 @@ class AppServerClient:
                 if target is not None:
                     target.put(message)
             elif isinstance(message.get("method"), str):
-                self.notifications.put(message)
+                try:
+                    self.notifications.put_nowait(message)
+                except queue.Full:
+                    # Quota collectors do not consume every notification.
+                    try:
+                        self.notifications.get_nowait()
+                    except queue.Empty:
+                        pass
+                    try:
+                        self.notifications.put_nowait(message)
+                    except queue.Full:
+                        pass
         self._closed.set()
 
     def _read_stderr(self) -> None:
@@ -215,8 +228,9 @@ class AppServerClient:
         self._send({"method": method, "params": params})
 
     def request(self, method: str, params: dict[str, Any] | None = None) -> Any:
-        request_id = self._next_id
-        self._next_id += 1
+        with self._pending_lock:
+            request_id = self._next_id
+            self._next_id += 1
         target: queue.Queue[dict[str, Any]] = queue.Queue(maxsize=1)
         with self._pending_lock:
             self._pending[request_id] = target
@@ -256,23 +270,13 @@ class AppServerClient:
 def _rate_windows(result: Any) -> list[dict[str, Any]]:
     if not isinstance(result, dict):
         return []
-    buckets: list[dict[str, Any]] = []
-    # The top-level bucket is the active Codex limit. Responses can also
-    # contain a base_model_inference weekly placeholder at 0% used; keeping
-    # Codex first prevents that equal-duration window from appearing as a
-    # transient 100% remaining value.
-    single = result.get("rateLimits")
-    if isinstance(single, dict):
-        buckets.append(single)
+    # Never combine different metered buckets into one Codex display.
     by_id = result.get("rateLimitsByLimitId")
-    if isinstance(by_id, dict):
-        codex = by_id.get("codex")
-        if isinstance(codex, dict):
-            buckets.append(codex)
-        buckets.extend(
-            value for key, value in by_id.items()
-            if key != "codex" and isinstance(value, dict)
-        )
+    selected = by_id.get("codex") if isinstance(by_id, dict) else None
+    if not isinstance(selected, dict):
+        single = result.get("rateLimits")
+        selected = single if isinstance(single, dict) and single.get("limitId", "codex") in {None, "codex"} else None
+    buckets = [selected] if isinstance(selected, dict) else []
     windows: list[dict[str, Any]] = []
     seen: set[tuple[int, int]] = set()
     for bucket in buckets:
@@ -338,7 +342,10 @@ def account_snapshot(rate_result: Any, usage_result: Any, now: datetime | None =
             account["reset_date"] = datetime.fromtimestamp(reset).astimezone().strftime("%m-%d %H:%M")
 
     if isinstance(rate_result, dict):
-        rate = rate_result.get("rateLimits")
+        by_id = rate_result.get("rateLimitsByLimitId")
+        rate = by_id.get("codex") if isinstance(by_id, dict) else None
+        if not isinstance(rate, dict):
+            rate = rate_result.get("rateLimits")
         if isinstance(rate, dict):
             account["plan_type"] = _safe_line(str(rate.get("planType") or ""), 31)
             account["rate_limit_reached"] = _safe_line(str(rate.get("rateLimitReachedType") or ""), 31)
@@ -634,8 +641,14 @@ class CodexAppServerSource:
         if not force and time.monotonic() - self.last_account_refresh < 60:
             return
         rate = self.client.request("account/rateLimits/read")
-        usage = self.client.request("account/usage/read")
+        try:
+            usage = self.client.request("account/usage/read")
+        except (AppServerError, OSError, ValueError):
+            # This optional endpoint can be unavailable while limits work.
+            usage = {}
         self.account = account_snapshot(rate, usage)
+        self.account["account_updated_at_epoch"] = int(time.time())
+        self.account["account_stale"] = False
         self.last_account_refresh = time.monotonic()
 
     def refresh_thread(self) -> None:
@@ -769,6 +782,8 @@ class CodexAppServerSource:
             ("账户额度", self.refresh_account, "_account_refresh_failures", "_has_account_snapshot"),
             ("任务状态", self.refresh_thread, "_thread_refresh_failures", "_has_thread_snapshot"),
         ):
+            if label == "任务状态" and os.environ.get("DOTII_CODEX_QUOTA_ONLY") == "1":
+                continue
             try:
                 refresh()
                 setattr(self, failure_name, 0)
@@ -779,10 +794,12 @@ class CodexAppServerSource:
                 if (not bool(getattr(self, cache_name, False)) or
                         failures >= TRANSIENT_REFRESH_FAILURE_LIMIT):
                     raise
+                if label == "账户额度":
+                    self.account["account_stale"] = True
                 print(f"Codex {label}暂时无法刷新，继续使用上次成功数据：{error}")
         return {
             "schema_version": 1,
-            "generated_at_epoch": int(time.time()),
+            "generated_at_epoch": self.account.get("account_updated_at_epoch", 0) if os.environ.get("DOTII_CODEX_QUOTA_ONLY") == "1" else int(time.time()),
             "preview_data": False,
             "source": "codex_app_server",
             "codex": {**self.account, "task": self.task, "tasks": self.tasks},
@@ -934,6 +951,8 @@ def probe_app_server(runtime_folder: Path, cwd: Path, codex_command: str | None 
         )
         errors: list[str] = []
         for key, method, params in calls:
+            if key == "threads" and os.environ.get("DOTII_CODEX_QUOTA_ONLY") == "1":
+                continue
             try:
                 response = client.request(method, params)
                 result["checks"][key] = True
@@ -943,8 +962,11 @@ def probe_app_server(runtime_folder: Path, cwd: Path, codex_command: str | None 
             except (AppServerError, OSError, ValueError) as error:
                 errors.append(f"{key}: {_safe_line(str(error), 180)}")
 
-        result["ok"] = all(result["checks"].values())
+        quota_only = os.environ.get("DOTII_CODEX_QUOTA_ONLY") == "1"
+        result["quota_only"] = quota_only
+        result["ok"] = result["checks"]["rate_limits"] if quota_only else all(result["checks"].values())
         result["detail"] = (
+            "NAS 额度读取正常；电脑任务不在此处采集" if quota_only and result["ok"] else
             "Codex CLI、App Server、账户、额度、用量与任务列表均可正常读取"
             if result["ok"] else "部分只读接口检测失败：" + "；".join(errors)
         )

@@ -30,7 +30,7 @@ class CodexUiConfigTests(unittest.TestCase):
 
     def test_module_config_migrates_dotii_as_enabled(self) -> None:
         modules = validate_module_config({"codex": True, "bambu": False})
-        self.assertEqual(modules, {"codex": True, "bambu": False, "dotii": True})
+        self.assertEqual(modules, {"codex": True, "bambu": False, "dotii": True, "ha": False})
 
     def test_dotii_state_prioritizes_failure_then_active_work(self) -> None:
         failed = dotii_state(

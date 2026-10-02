@@ -23,6 +23,10 @@ def current_platform() -> PlatformAdapter:
         from .macos import MacOSPlatformAdapter
 
         return MacOSPlatformAdapter()
+    if sys.platform.startswith("linux"):
+        from .linux import LinuxPlatformAdapter
+
+        return LinuxPlatformAdapter()
     raise RuntimeError(f"Dotii 管理中心暂不支持当前平台：{sys.platform}")
 
 

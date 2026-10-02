@@ -1,162 +1,76 @@
-# Dotii Display — NAS & Home Assistant
+# Dotii Display · NAS Docker 后台 + Home Assistant 触摸屏
 
-基于 [ZeroOne000011/Dotii-Display](https://github.com/ZeroOne000011/Dotii-Display) 的 NAS Docker 与 Home Assistant 扩展。上游源码和历史保留。
+让 Dotii 从桌面状态屏升级为家里的智能家居控制屏：**后台常驻 NAS，466×466 圆屏直接查看 Home Assistant 状态、控制灯光与空调，日常使用无需电脑常开。**
 
-- 极空间 Z4 / Linux amd64 Docker 后台，数据持久化、管理认证和健康检查。
-- Codex 账号额度由 NAS 独立读取，无需电脑常开。
-- 466×466 原生 Home Assistant 触摸界面：温湿度、灯光、空调、扫地机、车辆、NAS 及其他设备，最多 32 个实体。
-- 固件版本 **1.3.0-ha**；158 项后端回归检查通过。固件已编译，尚待设备刷入与实机触摸验收。
+本项目基于 [ZeroOne000011/Dotii-Display](https://github.com/ZeroOne000011/Dotii-Display) 扩展，保留上游源码、提交历史和原有 Codex / Bambu / 自定义画面 / Dotii 表情功能，新增 Linux Docker 后台及 **1.3.0-ha 原生触摸固件**。
 
-部署时复制 `.env.example` 为 `.env`，替换示例 NAS 地址、管理密码和设备令牌。HA 令牌在管理页面填写，仅保存到 NAS 数据目录。仓库不包含账号密码、HA/Codex 授权文件或个人数据备份。
+[下载固件与源码](https://github.com/jh1303366/Dotii-Display-NAS-HA/releases) · [NAS 部署教程](部署说明-极空间Z4.md) · [HA 接入与操作](Home-Assistant使用说明.md) · [验证与限制](Home-Assistant部署与检查报告.md) · [完整界面预览](docs/previews/index.html)
 
-[部署说明](部署说明-极空间Z4.md) · [HA 使用说明](Home-Assistant使用说明.md) · [检查报告](Home-Assistant部署与检查报告.md)
+![HA 原生圆屏八个主要界面](docs/previews/HA-新版主要界面.png)
 
-固件位于 `firmware/state_display.bin`，校验信息位于 `firmware/ha-firmware.json`。Mac 更新使用 `Mac更新屏幕.command`，只更新应用分区，保留既有配网。
+## 新功能一：NAS 上的 Docker 后台
 
-## 上游说明
+把管理中心放进 NAS，Dotii 通过 Wi-Fi 读取数据并提交触摸操作。只要 NAS、HA 和屏幕在线，电脑上的 Dotii 应用就可以关闭。
 
-# Dotii 桌面交互屏
+- **Linux amd64 / x86_64** 镜像，已在极空间 Z4 部署验证；附 Dockerfile、Compose 和手动构建镜像的 GitHub Actions 工作流。
+- 浏览器管理界面，支持独立管理账号、设备访问令牌、模块配置与上传素材。
+- `/data` 持久化，容器重建保留设置；健康检查、自动重启和日志轮转方便长期运行。
+- NAS 独立读取 Codex 账号额度，首次在官方页面授权；不依赖电脑上的登录目录。当前 NAS 版不采集电脑任务进度。
+- 保留 Bambu 局域网状态、控制和相机能力，相机可用性取决于打印机型号与网络。
+- NAS 不需要 USB、蓝牙直通或特权模式；首次配网、固件更新在电脑完成。
 
-Dotii 是一套由 ESP32-S3 圆形 AMOLED 桌面屏与 Windows/macOS 端“Dotii 管理中心”组成的开源状态显示系统。它可以显示 Codex 用量与任务状态、Bambu Lab 打印进度、自定义内容，并通过 Dotii 表情提供轻量互动。
+## 新功能二：Home Assistant 原生触摸固件
 
-![Dotii 桌面交互屏产品渲染图](assets/dotii-product-render.png)
+专为 **Waveshare ESP32-S3-Touch-AMOLED-1.75 / 466×466 圆屏** 制作。原生 LVGL 界面采用黑色背景、蓝色渐变圆环、大数字及圆形按钮；HA 数据由 NAS 转发，HA 令牌不会下发到屏幕。
 
-[Windows 下载](https://github.com/ZeroOne000011/Dotii-Display/releases/tag/v1.1.1) · [macOS 下载（预览版）](https://github.com/ZeroOne000011/Dotii-Display/releases/tag/v1.1.1-macos-preview.1) · [MakerWorld 模型与打印文件](https://makerworld.com.cn/zh/models/2918764-dotii-zhuo-mian-jiao-hu-ping#profileId-3421401) · [开发指南](开发指南.md)
+| 页面 | 显示与交互 |
+| --- | --- |
+| 首页 | 时间、温湿度、天气、所选实体在线率、灯光开启数量、PM2.5 |
+| 灯光 | 多灯切换、开关；支持亮度的实体可调光 |
+| 空调 | 多空调切换、目标温度与模式；按实体能力限制操作 |
+| 环境 | 温度、湿度与 PM2.5 |
+| 扫地机器人 | 电量与运行状态；按能力开放启动、暂停、停止、回充 |
+| 车辆 | 电量、续航、锁车、充电、车内温度与状态，只读 |
+| NAS | CPU、内存与温度，只读 |
+| 其他设备 | 开关与风扇；支持调速的风扇可调整百分比 |
 
-## 选择你的系统
+管理页可发现、选择、重命名和排序最多 **32 个 HA 实体**。支持 `sensor`、`binary_sensor`、`light`、`switch`、`fan`、`climate`、`weather`、`vacuum`。未接入的数据不会凭空显示，断线、过期或实体不可用时禁止控制。
 
-| 系统 | 支持范围 | 下载内容 | 当前状态 |
-| --- | --- | --- | --- |
-| Windows | Windows 10/11 x64 | `DotiiManagementCenter-1.1.1-portable.zip` | 正式版 |
-| macOS | Apple Silicon、macOS 13 及以上 | `DotiiManagementCenter-macOS-arm64-1.1.1.dmg` | 预览版，未经苹果公证 |
+车辆、NAS 及独立扫地机电量的专用角色目前使用示例实体 ID 映射；其他家庭需要按 [HA 使用说明](Home-Assistant使用说明.md) 调整映射。窗帘、场景和任意 HA 服务调用尚未实现。天气图形是装饰素材，天气文字来自 HA。
 
-macOS 预览版目前不支持 Intel Mac。由于尚未经过苹果公证，首次打开时需要在“系统设置 > 隐私与安全性”中手动允许。Windows 和 macOS 安装包均已包含运行所需组件，普通用户无需安装 Python、Node.js、Codex CLI、FFmpeg 或 ESP-IDF。
+## 从这里开始
 
-## 使用前准备
+需要：兼容圆屏、2.4 GHz Wi-Fi、可运行 Docker 的 amd64 NAS，以及已有的 Home Assistant。此项目连接现有 HA，不包含 HA 服务器本身。
 
-| 类别 | 项目 | 数量 | 购买/资料链接 |
-| --- | --- | ---: | --- |
-| 核心硬件 | 微雪 Waveshare ESP32-S3-Touch-AMOLED-1.75 开发板（含 1.75 英寸圆形屏，无外壳） | ×1 | [淘宝购买链接](https://e.tb.cn/h.8msjONXF0M0Vdg1?tk=X4anTUTbPSP) · [官方说明文档](https://docs.waveshare.net/ESP32-S3-Touch-AMOLED-1.75/) |
-| 供电 | 3.7 V、400 mAh 602030 锂电池，带 **MX1.25 2P 插头** | ×1 | [拼多多购买链接](https://mobile.yangkeduo.com/goods.html?ps=nMO2vEcuRY) |
-| 结构配件 | Type-C 弯公头转母头，用于底座内的接口引出 | ×1 | [拼多多购买链接](https://mobile.yangkeduo.com/goods.html?ps=m4Bzx5p2iF) |
-| 紧固件 | M2 螺丝，长度 4–7 mm 均可 | ×3 | — |
-| 3D 打印件 | 按 MakerWorld 模型打印的外壳、底座、按钮等结构件 | ×5 | [MakerWorld 模型、打印文件和装配资料](https://makerworld.com.cn/zh/models/2918764-dotii-zhuo-mian-jiao-hu-ping#profileId-3421401) |
-| 连接与网络 | 支持数据传输的 USB 线、2.4 GHz Wi-Fi | 各 ×1 | — |
-
-## Windows 快速上手
-
-1. 从 [Windows Release](https://github.com/ZeroOne000011/Dotii-Display/releases/tag/v1.1.1) 下载便携包，完整解压到一个新文件夹。
-2. 双击 `DotiiManagementCenter.exe`。程序会驻留在系统托盘，并在浏览器打开管理中心；默认地址为 `http://127.0.0.1:8787`。
-3. 用 USB 线连接 Dotii，在“设置”页面识别设备。首次使用时可通过“一键烧录”写入随包固件。
-4. 使用蓝牙配网，将 2.4 GHz Wi-Fi 和管理中心连接信息同步到 Dotii。
-5. 按需启用 Codex 或 Bambu，并在对应页面完成配置。
-
-请保持解压后的目录结构不变，不要单独移动或运行 `DotiiBridge.exe`。关闭浏览器不会退出管理中心；重新打开页面、查看日志或退出程序时，请使用系统托盘中的 Dotii 图标。
-
-### 更新 Windows 便携包
-
-先从系统托盘彻底退出旧版管理中心，再把新版 ZIP 完整解压到新的空文件夹。确认新版正常后，可以删除旧版程序文件夹；不要把新版直接覆盖到旧目录。
-
-现有设置保存在 `%LOCALAPPDATA%\StateDisplay`，删除旧版程序文件夹不会清除配置。若新版本包含 Dotii 固件更新，请在新版管理中心中重新执行“一键烧录”。
-
-## macOS 快速上手
-
-1. 从 [macOS Release](https://github.com/ZeroOne000011/Dotii-Display/releases/tag/v1.1.1-macos-preview.1) 下载 DMG。当前版本仅支持 Apple Silicon Mac 和 macOS 13 及以上。
-2. 打开 DMG，将 `DotiiManagementCenter-1.1.1.app` 拖到“应用程序”。
-3. 从“应用程序”打开 Dotii 管理中心。如果系统阻止启动，请打开“系统设置 > 隐私与安全性”，在对应提示旁选择“仍要打开”，然后再次确认。
-4. 首次扫描 Dotii 时允许蓝牙权限；连接 Dotii 或 Bambu 时按系统提示允许本地网络权限。
-5. 应用启动后会驻留在菜单栏。后续烧录、蓝牙配网及模块设置均在管理页面中完成。
-
-不需要也不建议全局关闭 macOS 的安全检查。受管理的公司或学校 Mac 可能禁止打开未经公证的应用。
-
-### 可选：校验下载文件
-
-将 DMG 和 `.dmg.sha256` 文件放在同一目录，在终端进入该目录并执行：
-
-```bash
-shasum -a 256 -c DotiiManagementCenter-macOS-arm64-1.1.1.dmg.sha256
+```sh
+git clone https://github.com/jh1303366/Dotii-Display-NAS-HA.git
+cd Dotii-Display-NAS-HA
+cp .env.example .env
 ```
 
-结果应显示 `OK`；如果校验失败，请不要打开该 DMG。
+编辑 `.env`：将 `DOTII_PUBLIC_URL` 改为屏幕可访问的 NAS 地址，设置至少 12 位的独立管理密码，替换设备令牌。然后在 NAS 或可用的 Docker 环境执行：
 
-### 更新与卸载
+```sh
+docker compose up -d --build
+```
 
-更新前先从菜单栏退出 Dotii 管理中心，再用新版 App 替换“应用程序”中的旧版。运行配置保存在 `~/Library/Application Support/Dotii`，替换或删除 App 不会自动清除配置。
+打开 `http://NAS地址:8787`，登录管理页，在 Home Assistant 栏填写 HA 地址和长期访问令牌，选择设备。首次使用时还需刷入固件并通过电脑蓝牙将 Wi-Fi、NAS 地址及设备令牌写入 Dotii。详细步骤见 [NAS 部署教程](部署说明-极空间Z4.md)。没有电脑 Docker，也可在自己的 Fork 中通过 Actions 构建 TAR 后导入 NAS。
 
-卸载时先退出应用，再将 App 移到废纸篓。如果不再需要原有配置，可以手动删除上述运行目录；其中可能包含 Bambu 访问码和设备连接信息，请勿上传或分享。
+**已有 Dotii 固件的设备**可用发布包中的 Mac 更新助手，只写应用分区，保留 Wi-Fi 与 NAS 配置。全新空白开发板需先安装完整基础固件；单独的 `state_display.bin` 不是完整出厂烧录包。
 
-## 主要功能
+## 下载、预览与验证
 
-- **Codex 状态**：显示官方接口提供的额度、用量、任务状态、计划进度和用户可见消息。
-- **Bambu 打印状态**：通过局域网读取打印进度、温度、耗材和图层，并在打印机支持时显示相机画面。
-- **自定义页面**：编辑文字、颜色、图片和圆环，保存后同步到 466 × 466 圆屏。
-- **Dotii 表情**：显示待机、眨眼、连接、工作、完成、失败等状态动画。
-- **设备管理**：提供蓝牙配网、重置配网、显示设置、休眠设置、登录自启动和受保护的一键烧录。
+- [Releases](https://github.com/jh1303366/Dotii-Display-NAS-HA/releases)：HA 固件、Mac 更新工具、完整源码和界面预览。
+- [预览目录](docs/previews)：52 张由实际 LVGL 固件代码渲染的界面图片，包含 HA 与原有系统页面。
+- 后端 158 项回归测试通过，其中 22 项 HA 专项检查；ESP-IDF v6.0.2 编译通过，NAS 容器及重启持久化已验证。
+- **目前为预发布版本**：尚未完成实体屏幕刷入、触摸、唤醒和断网恢复验收。电脑渲染用于查看布局，不能代替实机效果验证。ARM64 NAS 尚未验证。
 
-Codex 与 Bambu 首次运行默认关闭，不会在用户启用前自动安装、登录或连接外部服务。
+公开源码、固件和发布包不包含个人密码、HA 令牌、Codex 授权文件或运行配置。自己的 `.env` 与 `/data` 备份应私下保存。HTTP 管理入口适用于可信家庭局域网；不要直接转发到公网。
 
-## 常见问题
+## 开发与反馈
 
-<details>
-<summary><strong>管理页面没有自动打开</strong></summary>
+[通用开发指南](开发指南.md) · [Windows 开发指南](docs/development/windows.md) · [macOS 开发指南](docs/development/macos.md)
 
-Windows 请检查系统托盘，macOS 请检查菜单栏，然后通过 Dotii 图标重新打开管理页面。也可以在程序正在运行时访问 `http://127.0.0.1:8787`。
+欢迎通过 [Issues](https://github.com/jh1303366/Dotii-Display-NAS-HA/issues) 反馈问题，附上 NAS 架构、固件版本、操作步骤与脱敏日志。提供新设备适配时，说明 HA 实体类型、属性和支持的操作，避免提交令牌或真实授权文件。
 
-</details>
-
-<details>
-<summary><strong>Codex 页面没有数据</strong></summary>
-
-先确认 Codex 模块已启用，并已在官方 Codex 中完成登录。随后在 Codex 设置中运行“Codex 运行检测”，根据分项结果排查。接口没有提供的数值会显示为 `--`。
-
-</details>
-
-<details>
-<summary><strong>Bambu 页面没有打印数据或相机画面</strong></summary>
-
-确认电脑与打印机位于同一局域网，并检查打印机 IP、序列号、访问码和局域网模式。相机不可用不会影响打印状态。
-
-</details>
-
-<details>
-<summary><strong>管理中心找不到 Dotii</strong></summary>
-
-更换支持数据传输的 USB 线后重新扫描。若设备未进入下载模式，可按开发板说明使用 BOOT 按键后重试。程序只会向识别为 Dotii ESP32-S3 的设备开放烧录。
-
-macOS 用户还应在“系统设置 > 隐私与安全性 > 蓝牙”中确认已允许 Dotii 管理中心使用蓝牙。
-
-</details>
-
-<details>
-<summary><strong>更换路由器或电脑后无法连接</strong></summary>
-
-请长按 Dotii 右侧按钮进入“设置”，再长按“重置配网”1.2 秒。设备会清除 Wi-Fi、管理中心绑定和蓝牙配对后重启；随后在新电脑的管理中心重新扫描并配网，通常无需重新烧录固件。
-
-若系统仍保留旧配对，Windows 1.1.1 会尝试自动恢复；macOS 请在“系统设置 > 蓝牙”中忽略 Dotii 后重新扫描。
-
-</details>
-
-<details>
-<summary><strong>如何查找日志</strong></summary>
-
-Windows 日志位于 `%LOCALAPPDATA%\StateDisplay\bridge.log`，macOS 日志位于 `~/Library/Application Support/Dotii/bridge.log`。分享日志前，请检查并移除不希望公开的本机信息。
-
-</details>
-
-## 数据与安全
-
-- 管理网页和管理 API 只允许本机访问；Dotii 读取数据时需要设备访问令牌。
-- Wi-Fi 密码、Bambu 访问码、设备令牌和运行配置保存在本机用户目录，不应上传到公开仓库。
-- Bambu 数据通过局域网获取。暂停、继续和停止只会在打印机状态允许时开放，并需要用户明确操作。
-- 常规一键烧录不会擦除 NVS。请勿对未知设备、串口或固件执行烧录。
-- Windows 首次允许局域网访问时可能显示防火墙窗口，程序名称应为“Dotii 管理中心后台服务”。请按实际使用的网络类型授权。
-
-## 开发与二次开发
-
-普通用户不需要准备开发环境。准备修改源码时，请先选择对应文档：
-
-- [通用开发指南](开发指南.md)：项目架构、固件、协议、模块扩展、圆屏交互与通用测试规范。
-- [Windows 开发指南](docs/development/windows.md)：Windows 环境、托盘、蓝牙、串口、便携包与发布流程。
-- [macOS 开发指南](docs/development/macos.md)：macOS 菜单栏宿主、CoreBluetooth、串口、签名、公证与 DMG 构建。
-
-平台共用固件、后台业务、管理网页和设备协议。平台差异应保留在对应适配器、宿主与打包目录中，不应复制共用业务代码。
+感谢上游作者提供 Dotii 硬件、原生界面、桌面管理中心与基础协议。原项目及桌面安装包见 [Dotii-Display](https://github.com/ZeroOne000011/Dotii-Display)，外壳与装配资料见其 README。上游许可、依赖及素材的使用条件请分别核对，本扩展不另行承诺统一许可。

@@ -13,3 +13,8 @@ release/
 tools/
 .vscode/
 .DS_Store
+
+.env
+.venv/
+容器参数.txt
+*.tar

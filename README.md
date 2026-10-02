@@ -1,3 +1,20 @@
+# Dotii Display — NAS & Home Assistant
+
+基于 [ZeroOne000011/Dotii-Display](https://github.com/ZeroOne000011/Dotii-Display) 的 NAS Docker 与 Home Assistant 扩展。上游源码和历史保留。
+
+- 极空间 Z4 / Linux amd64 Docker 后台，数据持久化、管理认证和健康检查。
+- Codex 账号额度由 NAS 独立读取，无需电脑常开。
+- 466×466 原生 Home Assistant 触摸界面：温湿度、灯光、空调、扫地机、车辆、NAS 及其他设备，最多 32 个实体。
+- 固件版本 **1.3.0-ha**；158 项后端回归检查通过。固件已编译，尚待设备刷入与实机触摸验收。
+
+部署时复制 `.env.example` 为 `.env`，替换示例 NAS 地址、管理密码和设备令牌。HA 令牌在管理页面填写，仅保存到 NAS 数据目录。仓库不包含账号密码、HA/Codex 授权文件或个人数据备份。
+
+[部署说明](部署说明-极空间Z4.md) · [HA 使用说明](Home-Assistant使用说明.md) · [检查报告](Home-Assistant部署与检查报告.md)
+
+固件位于 `firmware/state_display.bin`，校验信息位于 `firmware/ha-firmware.json`。Mac 更新使用 `Mac更新屏幕.command`，只更新应用分区，保留既有配网。
+
+## 上游说明
+
 # Dotii 桌面交互屏
 
 Dotii 是一套由 ESP32-S3 圆形 AMOLED 桌面屏与 Windows/macOS 端“Dotii 管理中心”组成的开源状态显示系统。它可以显示 Codex 用量与任务状态、Bambu Lab 打印进度、自定义内容，并通过 Dotii 表情提供轻量互动。

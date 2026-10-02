@@ -1,0 +1,25 @@
+services:
+  dotii:
+    image: dotii-nas:local
+    build: .
+    container_name: dotii-nas
+    restart: unless-stopped
+    init: true
+    ports:
+      - "${DOTII_PORT:-8787}:8787"
+    environment:
+      TZ: Asia/Shanghai
+      DOTII_RUNTIME_DIR: /data
+      DOTII_PUBLIC_URL: ${DOTII_PUBLIC_URL:?请设置 NAS 局域网地址}
+      STATE_DISPLAY_BRIDGE_TOKEN: ${STATE_DISPLAY_BRIDGE_TOKEN:?请保留设备令牌}
+      DOTII_ADMIN_USER: ${DOTII_ADMIN_USER:-admin}
+      DOTII_ADMIN_PASSWORD: ${DOTII_ADMIN_PASSWORD:?请设置管理密码}
+    volumes:
+      - dotii-data:/data
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+volumes:
+  dotii-data:

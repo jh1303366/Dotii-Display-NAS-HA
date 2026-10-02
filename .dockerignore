@@ -1,0 +1,9 @@
+**
+!Dockerfile
+!requirements-nas.txt
+!bridge/
+!bridge/**
+!docker/
+!docker/**
+bridge/tests/
+**/__pycache__/

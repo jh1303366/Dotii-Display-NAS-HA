@@ -1,0 +1,31 @@
+name: Build NAS image
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  image:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build amd64 image
+        run: docker build --platform linux/amd64 -t dotii-nas:local .
+      - name: Verify container startup and authentication
+        run: |
+          docker run -d --name dotii-test -p 127.0.0.1:8787:8787 -e DOTII_ADMIN_PASSWORD=ci-test-password-1234 -e DOTII_PUBLIC_URL=http://192.168.1.10:8787 dotii-nas:local
+          for attempt in $(seq 1 30); do
+            if curl --fail -s http://127.0.0.1:8787/health; then break; fi
+            sleep 2
+          done
+          curl --fail -s http://127.0.0.1:8787/health
+          test "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8787/api/v1/admin/overview)" = 401
+          curl --fail -s -u admin:ci-test-password-1234 http://127.0.0.1:8787/api/v1/admin/overview > /dev/null
+          docker stop dotii-test
+      - name: Export image
+        run: docker save -o dotii-nas-amd64.tar dotii-nas:local
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dotii-nas-amd64
+          path: dotii-nas-amd64.tar
+          retention-days: 7

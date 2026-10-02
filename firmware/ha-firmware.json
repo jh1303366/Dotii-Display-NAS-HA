@@ -1,0 +1,15 @@
+{
+  "version": "1.3.0-ha",
+  "sha256": "0baca6d600c8fd9da284ff96ffcc32f9dcbd0db8242cca70d7b1688a77bf7962",
+  "size": 2836608,
+  "app_offset": "0x10000",
+  "screen": "466×466",
+  "built_with": "ESP-IDF v6.0.2",
+  "hardware_verified": false,
+  "source_hashes": {
+    "main/ha_ui.c": "4eeb3265c22085e3931eb7df6ce58687f374126468c6eaff9c27f25df4c307e3",
+    "main/state_ui.c": "e4647159da98da46b1cbe33d8b43f2f5ee1e33e6de80cf0fd0220558ad4dc68e",
+    "main/generated/ha_reference_art.c": "b96b073110596ba5e2a492c2b922e1c78d62337fe576e486d0ac31f06ecdb05e",
+    "main/generated/ui_font_ha_numbers_80.c": "65ded8eea15b2aee2e21c1543705a0d3b62a8b93aee6bc47ba21ed7aebb531a0"
+  }
+}

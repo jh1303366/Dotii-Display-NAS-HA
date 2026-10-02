@@ -18,6 +18,7 @@
 #include "esp_netif_sntp.h"
 #include "esp_wifi.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include "freertos/event_groups.h"
 #include "freertos/task.h"
 #include "sdkconfig.h"
@@ -39,6 +40,8 @@ static bool s_bridge_online;
 static uint8_t s_bridge_failures;
 static char s_ip[24] = "--";
 static char s_bridge_note[48] = "正在启动";
+/* 快照解析互斥：Wi-Fi 拉取与 BLE 推送两个来源共用解析与发布路径。 */
+static SemaphoreHandle_t s_parse_lock;
 /* Snapshot payloads are large and do not participate in DMA. Keep them in
    PSRAM so the Wi-Fi driver retains enough internal RAM for its RX buffers. */
 EXT_RAM_BSS_ATTR static codex_snapshot_t s_last_snapshot;
@@ -449,15 +452,23 @@ static void copy_module_config(cJSON *root, codex_snapshot_t *snapshot)
     snapshot->codex_enabled = true;
     snapshot->bambu_enabled = true;
     snapshot->dotii_enabled = true;
+    /* Older management centers never publish modules.zai; keep the page
+       hidden until the field explicitly enables it. */
+    snapshot->zai_enabled = false;
+    snapshot->claudecode_enabled = false;
     cJSON *modules = cJSON_GetObjectItemCaseSensitive(root, "modules");
     if (!cJSON_IsObject(modules)) return;
 
     cJSON *codex = cJSON_GetObjectItemCaseSensitive(modules, "codex");
     cJSON *bambu = cJSON_GetObjectItemCaseSensitive(modules, "bambu");
     cJSON *dotii = cJSON_GetObjectItemCaseSensitive(modules, "dotii");
+    cJSON *zai = cJSON_GetObjectItemCaseSensitive(modules, "zai");
+    cJSON *claudecode = cJSON_GetObjectItemCaseSensitive(modules, "claudecode");
     if (cJSON_IsBool(codex)) snapshot->codex_enabled = cJSON_IsTrue(codex);
     if (cJSON_IsBool(bambu)) snapshot->bambu_enabled = cJSON_IsTrue(bambu);
     if (cJSON_IsBool(dotii)) snapshot->dotii_enabled = cJSON_IsTrue(dotii);
+    if (cJSON_IsBool(zai)) snapshot->zai_enabled = cJSON_IsTrue(zai);
+    if (cJSON_IsBool(claudecode)) snapshot->claudecode_enabled = cJSON_IsTrue(claudecode);
 }
 
 static uint32_t dotii_state_token_from_string(const char *value)
@@ -503,6 +514,8 @@ static void copy_dotii_state(cJSON *root, codex_snapshot_t *snapshot)
     }
     cJSON *assigned = cJSON_GetObjectItemCaseSensitive(dotii, "state_assigned");
     if (cJSON_IsBool(assigned)) snapshot->dotii_state_assigned = cJSON_IsTrue(assigned);
+    snapshot->dotii_return_enabled = cJSON_IsTrue(
+        cJSON_GetObjectItemCaseSensitive(dotii, "return_to_dotii"));
     if (!snapshot->dotii_state_assigned) {
         snapshot->dotii_expression = DOTII_EXPRESSION_IDLE_BREATH;
         snapshot->dotii_base_idle = true;
@@ -639,6 +652,90 @@ static void copy_bambu_status(cJSON *root, codex_snapshot_t *snapshot)
     }
 }
 
+static void copy_zai_status(cJSON *root, codex_snapshot_t *snapshot)
+{
+    snapshot->zai_configured = false;
+    snapshot->zai_connected = false;
+    snapshot->zai_five_hour_available = false;
+    snapshot->zai_weekly_available = false;
+    snapshot->zai_five_hour_remaining_percent = 0;
+    snapshot->zai_weekly_remaining_percent = 0;
+    snapshot->zai_plan_level[0] = '\0';
+    snapshot->zai_five_hour_reset_date[0] = '\0';
+    snapshot->zai_weekly_reset_date[0] = '\0';
+    cJSON *zai = cJSON_GetObjectItemCaseSensitive(root, "zai");
+    if (!cJSON_IsObject(zai)) return;
+
+    snapshot->zai_configured = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(zai, "configured"));
+    snapshot->zai_connected = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(zai, "connected"));
+    snapshot->zai_five_hour_available = cJSON_IsTrue(
+        cJSON_GetObjectItemCaseSensitive(zai, "five_hour_available"));
+    snapshot->zai_weekly_available = cJSON_IsTrue(
+        cJSON_GetObjectItemCaseSensitive(zai, "weekly_available"));
+    copy_json_string(zai, "plan_level", snapshot->zai_plan_level, sizeof(snapshot->zai_plan_level));
+    copy_json_string(zai, "five_hour_reset_date", snapshot->zai_five_hour_reset_date,
+                     sizeof(snapshot->zai_five_hour_reset_date));
+    copy_json_string(zai, "weekly_reset_date", snapshot->zai_weekly_reset_date,
+                     sizeof(snapshot->zai_weekly_reset_date));
+    cJSON *remaining = cJSON_GetObjectItemCaseSensitive(zai, "five_hour_remaining_percent");
+    cJSON *weekly = cJSON_GetObjectItemCaseSensitive(zai, "weekly_remaining_percent");
+    if (cJSON_IsNumber(remaining)) {
+        int value = remaining->valueint;
+        if (value < 0) value = 0;
+        if (value > 100) value = 100;
+        snapshot->zai_five_hour_remaining_percent = value;
+    }
+    if (cJSON_IsNumber(weekly)) {
+        int value = weekly->valueint;
+        if (value < 0) value = 0;
+        if (value > 100) value = 100;
+        snapshot->zai_weekly_remaining_percent = value;
+    }
+}
+
+static void copy_claudecode_status(cJSON *root, codex_snapshot_t *snapshot)
+{
+    snapshot->claudecode_connected = false;
+    snapshot->claudecode_status = CODEX_STATUS_OFFLINE;
+    snapshot->claudecode_session_count = 0;
+    snapshot->claudecode_updated_at = 0;
+    memset(snapshot->claudecode_sessions, 0, sizeof(snapshot->claudecode_sessions));
+    cJSON *claudecode = cJSON_GetObjectItemCaseSensitive(root, "claudecode");
+    if (!cJSON_IsObject(claudecode)) return;
+
+    snapshot->claudecode_connected = cJSON_IsTrue(
+        cJSON_GetObjectItemCaseSensitive(claudecode, "connected"));
+    cJSON *status = cJSON_GetObjectItemCaseSensitive(claudecode, "status");
+    snapshot->claudecode_status = app_state_status_from_string(
+        cJSON_IsString(status) ? status->valuestring : "idle");
+    cJSON *sessions = cJSON_GetObjectItemCaseSensitive(claudecode, "session_count");
+    if (cJSON_IsNumber(sessions)) {
+        int value = sessions->valueint;
+        if (value < 0) value = 0;
+        if (value > 99) value = 99;
+        snapshot->claudecode_session_count = (uint8_t)value;
+    }
+    cJSON *updated = cJSON_GetObjectItemCaseSensitive(claudecode, "updated_at_epoch");
+    snapshot->claudecode_updated_at = cJSON_IsNumber(updated) ? (time_t)updated->valuedouble : 0;
+
+    cJSON *session_list = cJSON_GetObjectItemCaseSensitive(claudecode, "sessions");
+    if (cJSON_IsArray(session_list)) {
+        uint8_t index = 0;
+        cJSON *item = NULL;
+        cJSON_ArrayForEach(item, session_list) {
+            if (!cJSON_IsObject(item) || index >= CLAUDECODE_SESSION_MAX) break;
+            claudecode_session_t *session = &snapshot->claudecode_sessions[index];
+            cJSON *item_status = cJSON_GetObjectItemCaseSensitive(item, "status");
+            session->status = app_state_status_from_string(
+                cJSON_IsString(item_status) ? item_status->valuestring : "idle");
+            copy_json_string(item, "project", session->project, sizeof(session->project));
+            cJSON *item_updated = cJSON_GetObjectItemCaseSensitive(item, "updated_at_epoch");
+            session->updated_at = cJSON_IsNumber(item_updated) ? (time_t)item_updated->valuedouble : 0;
+            index++;
+        }
+    }
+}
+
 static bool parse_snapshot(const char *json, codex_snapshot_t *snapshot)
 {
     bool ok = false;
@@ -739,6 +836,8 @@ static bool parse_snapshot(const char *json, codex_snapshot_t *snapshot)
     }
     copy_custom_config(root, snapshot);
     copy_bambu_status(root, snapshot);
+    copy_zai_status(root, snapshot);
+    copy_claudecode_status(root, snapshot);
     copy_dotii_state(root, snapshot);
     ok = true;
 
@@ -1013,6 +1112,35 @@ static void publish_offline_state(void)
     app_state_publish(&s_work_snapshot);
 }
 
+/* 用快照携带的服务器时间校准时钟（蓝牙模式无 SNTP，这是唯一时间源）。 */
+static void calibrate_clock_from_snapshot(time_t generated_at)
+{
+    if (generated_at <= 0) return;
+    time_t now = time(NULL);
+    if (now >= generated_at && now - generated_at < 30) return; /* 已同步 */
+    if (now > generated_at + 86400) return; /* 本地时间明显超前，不动 */
+    struct timeval tv = {.tv_sec = generated_at, .tv_usec = 0};
+    settimeofday(&tv, NULL);
+}
+
+/* BLE 快照通道入口：校验并发布推送的快照（与 Wi-Fi 拉取共用 parse_snapshot）。 */
+bool connectivity_ingest_snapshot(const char *json, uint32_t length)
+{
+    if (json == NULL || length == 0) return false;
+    if (!xSemaphoreTake(s_parse_lock, pdMS_TO_TICKS(500))) return false;
+    bool ok = false;
+    if (parse_snapshot(json, &s_work_snapshot)) {
+        calibrate_clock_from_snapshot(s_work_snapshot.generated_at);
+        s_last_snapshot = s_work_snapshot;
+        s_have_snapshot = true;
+        strlcpy(s_bridge_note, "蓝牙已连接", sizeof(s_bridge_note));
+        app_state_publish(&s_work_snapshot);
+        ok = true;
+    }
+    xSemaphoreGive(s_parse_lock);
+    return ok;
+}
+
 static void bridge_task(void *argument)
 {
     (void)argument;
@@ -1105,6 +1233,12 @@ void connectivity_start(void)
     const device_config_values_t *device_config = device_config_get();
     ESP_LOGI(TAG, "Preparing bridge data channel");
     s_events = xEventGroupCreate();
+    s_parse_lock = xSemaphoreCreateMutex();
+    if (s_parse_lock == NULL) {
+        strlcpy(s_bridge_note, "内部资源不足", sizeof(s_bridge_note));
+        ESP_LOGE(TAG, "Unable to create snapshot parse lock");
+        return;
+    }
     s_bambu_command_queue = xQueueCreate(4, sizeof(bambu_command_t));
     s_work_tasks = heap_caps_calloc(CODEX_TASK_DETAIL_MAX, sizeof(*s_work_tasks),
                                     MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
@@ -1122,6 +1256,13 @@ void connectivity_start(void)
     if (task_created != pdPASS) {
         strlcpy(s_bridge_note, "管理中心任务启动失败", sizeof(s_bridge_note));
         ESP_LOGE(TAG, "Unable to create bridge task");
+    }
+    if (device_config->link_mode == DEVICE_LINK_MODE_BLE) {
+        /* 蓝牙精简模式：不起 Wi-Fi，快照由 BLE 通道推送。 */
+        strlcpy(s_bridge_note, "等待蓝牙连接", sizeof(s_bridge_note));
+        ESP_LOGI(TAG, "BLE link mode: Wi-Fi station disabled");
+        ESP_LOGI(TAG, "Connectivity services started (BLE)");
+        return;
     }
     ESP_LOGI(TAG, "Starting Wi-Fi station");
     wifi_start();

@@ -69,6 +69,30 @@ typedef struct {
     time_t updated_at;
 } codex_task_detail_t;
 
+#define HA_ENTITY_MAX 32
+#define HA_MODE_MAX 7
+typedef struct {
+    char label[41];
+    char domain[16];
+    char state[41];
+    char unit[12];
+    char role[24];
+    float brightness, percentage, humidity, battery_level;
+    bool brightness_supported, percentage_supported;
+    uint8_t vacuum_actions;
+    char modes[HA_MODE_MAX][16];
+    uint8_t mode_count;
+    bool available;
+    bool controllable;
+    bool temperature_available;
+    bool current_temperature_available;
+    float temperature;
+    float current_temperature;
+    float min_temp;
+    float max_temp;
+    float temp_step;
+} ha_entity_t;
+
 typedef struct {
     bool valid;
     bool preview_data;
@@ -83,6 +107,14 @@ typedef struct {
     bool bambu_enabled;
     bool custom_enabled;
     bool dotii_enabled;
+    bool ha_enabled;
+    bool ha_connected;
+    uint32_t ha_revision;
+    uint32_t ha_result_seq;
+    time_t ha_updated_at;
+    uint8_t ha_entity_count;
+    ha_entity_t ha_entities[HA_ENTITY_MAX];
+    char ha_note[128];
     bool custom_image_available;
     bool custom_ring_enabled;
     bool codex_ui_dual_limit;

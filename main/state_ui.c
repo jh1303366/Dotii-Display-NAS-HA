@@ -1,4 +1,5 @@
 #include "state_ui.h"
+#include "ha_ui.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -41,7 +42,7 @@ LV_FONT_DECLARE(ui_font_fixed_20);
 #define COLOR_BAMBU 0x00AE42
 #define COLOR_WARNING 0xF2C66D
 #define COLOR_DANGER 0xFF766F
-#define PAGE_COUNT 4
+#define PAGE_COUNT 5
 #define TITLE_HEIGHT 30
 #define DISPLAY_ANGLE_DEFAULT_TENTHS 840
 #define DISPLAY_ANGLE_MIN_TENTHS 800
@@ -68,6 +69,8 @@ static lv_obj_t *s_bambu_main;
 static lv_obj_t *s_bambu_detail;
 static lv_obj_t *s_custom;
 static lv_obj_t *s_dotii;
+static lv_obj_t *s_ha;
+static lv_obj_t *s_ha_quick;
 static lv_obj_t *s_control;
 static lv_obj_t *s_settings;
 static lv_obj_t *s_power;
@@ -405,6 +408,7 @@ static void add_activity_event(lv_obj_t *screen)
 
 static void return_from_current(void)
 {
+    if (s_current == s_ha) {ha_ui_back(); return;}
     if (s_current == s_detail) load_screen(enabled_return_screen(page_screen(0)), false);
     else if (s_current == s_bambu_detail) load_screen(enabled_return_screen(s_bambu_main), false);
     else if (s_current == s_settings) load_screen(first_enabled_screen(), false);
@@ -429,6 +433,11 @@ static void swipe_event(lv_event_t *event)
         /* One upward swipe advances one viewport step. */
     } else if (direction == LV_DIR_BOTTOM && page_scroll_current(false)) {
         /* One downward swipe returns one viewport step. */
+    } else if (s_current == s_ha && direction == LV_DIR_LEFT) {
+        ha_ui_page(1);
+    } else if (s_current == s_ha && direction == LV_DIR_RIGHT) {
+        if (ha_ui_detail_active()) ha_ui_back();
+        else ha_ui_page(-1);
     } else if ((s_current == s_main || s_current == s_plus_main) && direction == LV_DIR_LEFT) {
         s_detail_task_index = 0;
         s_detail_thread_id[0] = '\0';
@@ -773,7 +782,8 @@ static bool page_enabled(uint8_t page)
     if (page == 0) return s_snapshot.codex_enabled;
     if (page == 1) return s_snapshot.bambu_enabled;
     if (page == 2) return s_snapshot.custom_enabled;
-    return s_snapshot.dotii_enabled;
+    if (page == 3) return s_snapshot.dotii_enabled;
+    return s_snapshot.ha_enabled;
 }
 
 static lv_obj_t *page_screen(uint8_t page)
@@ -781,7 +791,8 @@ static lv_obj_t *page_screen(uint8_t page)
     if (page == 0) return s_snapshot.codex_ui_dual_limit ? s_plus_main : s_main;
     if (page == 1) return s_bambu_main;
     if (page == 2) return s_custom;
-    return s_dotii;
+    if (page == 3) return s_dotii;
+    return s_ha;
 }
 
 static lv_obj_t *first_enabled_screen(void)
@@ -798,6 +809,7 @@ static bool screen_enabled(lv_obj_t *screen)
     if (screen == s_bambu_main || screen == s_bambu_detail) return page_enabled(1);
     if (screen == s_custom) return page_enabled(2);
     if (screen == s_dotii) return page_enabled(3);
+    if (screen == s_ha) return page_enabled(4);
     return true;
 }
 
@@ -809,7 +821,7 @@ static lv_obj_t *enabled_return_screen(lv_obj_t *screen)
 
 static void update_page_dots(void)
 {
-    static const uint32_t active_colors[PAGE_COUNT] = {COLOR_BLUE, COLOR_BAMBU, COLOR_WARNING, COLOR_CYAN};
+    static const uint32_t active_colors[PAGE_COUNT] = {COLOR_BLUE, COLOR_BAMBU, COLOR_WARNING, COLOR_CYAN, 0x60CAFF};
     for (uint8_t row = 0; row < PAGE_COUNT; ++row) {
         int total_width = 0;
         uint8_t count = 0;
@@ -1927,6 +1939,13 @@ static void build_control(void)
     s_bambu_quick = make_quick_button(row, &ui_icon_bambu_36, COLOR_BAMBU);
     s_custom_quick = make_quick_button(row, NULL, COLOR_WARNING);
     s_dotii_quick = make_quick_button(row, NULL, COLOR_CYAN);
+    s_ha_quick = make_quick_button(row, NULL, 0x60CAFF);
+    lv_obj_clean(s_ha_quick);
+    lv_obj_t *ha_icon = make_label(s_ha_quick, LV_SYMBOL_HOME, &lv_font_montserrat_32, 0x60CAFF);
+    lv_obj_center(ha_icon);
+    lv_obj_t *quick_buttons[] = {s_codex_quick, s_bambu_quick, s_custom_quick, s_dotii_quick, s_ha_quick};
+    for (size_t i=0;i<5;i++) lv_obj_set_size(quick_buttons[i], 60, 72);
+    lv_obj_add_event_cb(s_ha_quick, quick_clicked, LV_EVENT_CLICKED, s_ha);
     lv_obj_clean(s_dotii_quick);
     make_dotii_part(s_dotii_quick, 12, 20, -12, -2, COLOR_CYAN);
     make_dotii_part(s_dotii_quick, 12, 20, 12, -2, COLOR_CYAN);
@@ -2093,6 +2112,11 @@ static void update_snapshot(const codex_snapshot_t *snapshot)
         s_dotii_state_started = lv_tick_get();
     }
     s_snapshot = *snapshot;
+    ha_ui_update(&s_snapshot);
+    if (s_ha_quick) {
+        if (snapshot->ha_enabled) lv_obj_remove_flag(s_ha_quick, LV_OBJ_FLAG_HIDDEN);
+        else lv_obj_add_flag(s_ha_quick, LV_OBJ_FLAG_HIDDEN);
+    }
     if (snapshot->docked_rotation_tenths >= DISPLAY_ANGLE_MIN_TENTHS &&
         snapshot->docked_rotation_tenths <= DISPLAY_ANGLE_MAX_TENTHS &&
         (snapshot->docked_rotation_tenths != s_display_angle_tenths ||
@@ -2336,6 +2360,7 @@ static void update_snapshot(const codex_snapshot_t *snapshot)
 
 static void ui_timer(lv_timer_t *timer)
 {
+    ha_ui_tick();
     (void)timer;
     if (xQueueReceive(s_snapshot_queue, &s_snapshot, 0) == pdTRUE) update_snapshot(&s_snapshot);
 
@@ -2377,6 +2402,11 @@ static void ui_timer(lv_timer_t *timer)
     }
 }
 
+static bool ha_touch_allowed(void)
+{
+    return s_screen_on && !s_screen_saver_active && !s_wake_touch_in_progress;
+}
+
 void state_ui_start(QueueHandle_t snapshot_queue)
 {
     s_snapshot_queue = snapshot_queue;
@@ -2394,6 +2424,10 @@ void state_ui_start(QueueHandle_t snapshot_queue)
     build_bambu();
     build_custom();
     build_dotii();
+    s_ha = ha_ui_create(ha_touch_allowed);
+    add_activity_event(s_ha);
+    lv_obj_add_event_cb(s_ha, swipe_event, LV_EVENT_GESTURE, NULL);
+    /* HA renders its own eight-section page indicator. */
     build_settings();
     build_control();
     build_power();
@@ -2431,7 +2465,7 @@ void state_ui_button_a_short(void)
     }
     int current_page = (s_current == s_main || s_current == s_plus_main) ? 0 :
         s_current == s_bambu_main ? 1 : s_current == s_custom ? 2 :
-        s_current == s_dotii ? 3 : -1;
+        s_current == s_dotii ? 3 : s_current == s_ha ? 4 : -1;
     if (current_page < 0) {
         load_screen(first_enabled_screen(), true);
         return;

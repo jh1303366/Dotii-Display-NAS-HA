@@ -51,6 +51,15 @@ static uint8_t *s_bambu_camera_buffers[2];
 static uint32_t s_bambu_camera_revisions[2];
 static int s_bambu_camera_active = -1;
 static QueueHandle_t s_bambu_command_queue;
+static QueueHandle_t s_ha_command_queue;
+typedef struct {
+    uint8_t slot;
+    uint32_t revision;
+    char action[16];
+    char value[20];
+} ha_command_t;
+static char s_ha_command_note[128];
+static uint32_t s_ha_result_seq;
 static codex_task_detail_t *s_work_tasks;
 static size_t s_work_task_count;
 
@@ -65,6 +74,7 @@ typedef struct {
     size_t capacity;
     size_t length;
     bool overflow;
+    bool grow;
 } http_body_t;
 
 static void blacken_custom_frame_near_black_edge(uint8_t *data)
@@ -444,6 +454,62 @@ static void copy_custom_config(cJSON *root, codex_snapshot_t *snapshot)
     }
 }
 
+static void copy_ha(cJSON *root, codex_snapshot_t *snapshot)
+{
+    cJSON *ha = cJSON_GetObjectItemCaseSensitive(root, "ha");
+    if (!cJSON_IsObject(ha)) return;
+    snapshot->ha_connected = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(ha, "connected"));
+    cJSON *revision = cJSON_GetObjectItemCaseSensitive(ha, "revision");
+    cJSON *updated = cJSON_GetObjectItemCaseSensitive(ha, "updated_at_epoch");
+    if (cJSON_IsNumber(revision)) snapshot->ha_revision = (uint32_t)revision->valuedouble;
+    if (cJSON_IsNumber(updated)) snapshot->ha_updated_at = (time_t)updated->valuedouble;
+    snapshot->ha_result_seq = s_ha_result_seq;
+    copy_json_string(ha, "command_note", snapshot->ha_note, sizeof(snapshot->ha_note));
+    if (strlen(s_ha_command_note)) strlcpy(snapshot->ha_note, s_ha_command_note, sizeof(snapshot->ha_note));
+    cJSON *entities = cJSON_GetObjectItemCaseSensitive(ha, "entities");
+    cJSON *item;
+    cJSON_ArrayForEach(item, entities) {
+        if (!cJSON_IsObject(item) || snapshot->ha_entity_count >= HA_ENTITY_MAX) break;
+        ha_entity_t *entity = &snapshot->ha_entities[snapshot->ha_entity_count++];
+        copy_json_string(item, "label", entity->label, sizeof(entity->label));
+        copy_json_string(item, "domain", entity->domain, sizeof(entity->domain));
+        copy_json_string(item, "state", entity->state, sizeof(entity->state));
+        copy_json_string(item, "unit", entity->unit, sizeof(entity->unit));
+        copy_json_string(item, "role", entity->role, sizeof(entity->role));
+        cJSON *val = cJSON_GetObjectItemCaseSensitive(item,"brightness");entity->brightness=cJSON_IsNumber(val)?val->valuedouble:-1;
+        val=cJSON_GetObjectItemCaseSensitive(item,"percentage");entity->percentage=cJSON_IsNumber(val)?val->valuedouble:-1;
+        val=cJSON_GetObjectItemCaseSensitive(item,"humidity");entity->humidity=cJSON_IsNumber(val)?val->valuedouble:-1;
+        val=cJSON_GetObjectItemCaseSensitive(item,"battery_level");entity->battery_level=cJSON_IsNumber(val)?val->valuedouble:-1;
+        cJSON *allowed;
+        cJSON_ArrayForEach(allowed,cJSON_GetObjectItemCaseSensitive(item,"actions")){
+            if(cJSON_IsString(allowed)&&strcmp(allowed->valuestring,"brightness")==0)entity->brightness_supported=true;
+            if(cJSON_IsString(allowed)&&strcmp(allowed->valuestring,"percentage")==0)entity->percentage_supported=true;
+            const char *vacuum_actions[]={"start","pause","stop","return_to_base"};
+            for(int a=0;a<4;a++)if(cJSON_IsString(allowed)&&strcmp(allowed->valuestring,vacuum_actions[a])==0)entity->vacuum_actions|=1<<a;
+        }
+
+        entity->available = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(item, "available"));
+        entity->controllable = cJSON_GetArraySize(cJSON_GetObjectItemCaseSensitive(item, "actions")) > 0;
+        cJSON *temperature = cJSON_GetObjectItemCaseSensitive(item, "temperature");
+        entity->temperature_available = cJSON_IsNumber(temperature);
+        if (entity->temperature_available) entity->temperature = temperature->valuedouble;
+        temperature = cJSON_GetObjectItemCaseSensitive(item, "current_temperature");
+        entity->current_temperature_available = cJSON_IsNumber(temperature);
+        if (entity->current_temperature_available) entity->current_temperature = temperature->valuedouble;
+        cJSON *number = cJSON_GetObjectItemCaseSensitive(item, "min_temp");
+        entity->min_temp = cJSON_IsNumber(number) ? number->valuedouble : 16;
+        number = cJSON_GetObjectItemCaseSensitive(item, "max_temp");
+        entity->max_temp = cJSON_IsNumber(number) ? number->valuedouble : 30;
+        number = cJSON_GetObjectItemCaseSensitive(item, "temp_step");
+        entity->temp_step = cJSON_IsNumber(number) && number->valuedouble > 0 ? number->valuedouble : 1;
+        cJSON *mode;
+        cJSON_ArrayForEach(mode, cJSON_GetObjectItemCaseSensitive(item, "hvac_modes")) {
+            if (cJSON_IsString(mode) && entity->mode_count < HA_MODE_MAX)
+                strlcpy(entity->modes[entity->mode_count++], mode->valuestring, 16);
+        }
+    }
+}
+
 static void copy_module_config(cJSON *root, codex_snapshot_t *snapshot)
 {
     snapshot->codex_enabled = true;
@@ -455,6 +521,7 @@ static void copy_module_config(cJSON *root, codex_snapshot_t *snapshot)
     cJSON *codex = cJSON_GetObjectItemCaseSensitive(modules, "codex");
     cJSON *bambu = cJSON_GetObjectItemCaseSensitive(modules, "bambu");
     cJSON *dotii = cJSON_GetObjectItemCaseSensitive(modules, "dotii");
+    snapshot->ha_enabled = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(modules, "ha"));
     if (cJSON_IsBool(codex)) snapshot->codex_enabled = cJSON_IsTrue(codex);
     if (cJSON_IsBool(bambu)) snapshot->bambu_enabled = cJSON_IsTrue(bambu);
     if (cJSON_IsBool(dotii)) snapshot->dotii_enabled = cJSON_IsTrue(dotii);
@@ -656,6 +723,7 @@ static bool parse_snapshot(const char *json, codex_snapshot_t *snapshot)
     snapshot->valid = true;
     snapshot->source_online = true;
     copy_module_config(root, snapshot);
+    copy_ha(root, snapshot);
     copy_display_config(root, snapshot);
 
     cJSON *preview = cJSON_GetObjectItemCaseSensitive(root, "preview_data");
@@ -751,8 +819,9 @@ static esp_err_t http_event_handler(esp_http_client_event_t *event)
 {
     http_body_t *response = (http_body_t *)event->user_data;
     if (event->event_id == HTTP_EVENT_ON_DATA && response != NULL &&
-        response->body != NULL && event->data_len > 0) {
+        response->body != NULL && !response->overflow && event->data_len > 0) {
         size_t required = response->length + (size_t)event->data_len + 1;
+        if (required > 524288 || (required > response->capacity && !response->grow)) {response->overflow = true; return ESP_OK;}
         if (required > response->capacity) {
             size_t capacity = response->capacity;
             while (capacity < required && capacity <= SIZE_MAX / 2) capacity *= 2;
@@ -896,7 +965,7 @@ static bool fetch_snapshot(codex_snapshot_t *snapshot)
     char *body = heap_caps_calloc(1, HTTP_BODY_INITIAL_CAPACITY,
                                   MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (body == NULL) return false;
-    http_body_t response = {.body = body, .capacity = HTTP_BODY_INITIAL_CAPACITY};
+    http_body_t response = {.body = body, .capacity = HTTP_BODY_INITIAL_CAPACITY, .grow = true};
     esp_http_client_config_t config = {
         .url = device_config->bridge_url,
         .event_handler = http_event_handler,
@@ -995,6 +1064,48 @@ static bool send_bambu_command(bambu_command_t command)
     return error == ESP_OK && status == 202;
 }
 
+static void send_ha_command(const ha_command_t *command)
+{
+    const device_config_values_t *device_config = device_config_get();
+    char url[256];
+    strlcpy(url, device_config->bridge_url, sizeof(url));
+    char *last_slash = strrchr(url, '/');
+    if (last_slash == NULL) return;
+    strlcpy(last_slash + 1, "ha/command", sizeof(url) - (size_t)(last_slash + 1 - url));
+    cJSON *payload = cJSON_CreateObject();
+    if (payload == NULL) return;
+    cJSON_AddNumberToObject(payload, "slot", command->slot);
+    cJSON_AddNumberToObject(payload, "revision", command->revision);
+    cJSON_AddStringToObject(payload, "action", command->action);
+    if (strcmp(command->action, "temperature") == 0 || strcmp(command->action,"brightness")==0 || strcmp(command->action,"percentage")==0) cJSON_AddNumberToObject(payload, "value", strtof(command->value, NULL));
+    else cJSON_AddStringToObject(payload, "value", command->value);
+    char *body = cJSON_PrintUnformatted(payload);
+    cJSON_Delete(payload);
+    if (body == NULL) return;
+    char *response_body = heap_caps_calloc(1, 8192, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (response_body == NULL) {free(body); return;}
+    http_body_t response = {.body = response_body, .capacity = 8192, .grow = true};
+    esp_http_client_config_t config = {.url = url, .event_handler = http_event_handler, .user_data = &response,
+        .timeout_ms = 25000, .buffer_size = 1024, .crt_bundle_attach = esp_crt_bundle_attach};
+    esp_http_client_handle_t client = esp_http_client_init(&config);
+    if (client == NULL) { free(body); heap_caps_free(response_body); return; }
+    esp_http_client_set_method(client, HTTP_METHOD_POST);
+    esp_http_client_set_header(client, "Content-Type", "application/json");
+    esp_http_client_set_header(client, "X-Bridge-Token", device_config->bridge_token);
+    esp_http_client_set_post_field(client, body, strlen(body));
+    esp_err_t error = esp_http_client_perform(client);
+    int status = esp_http_client_get_status_code(client);
+    esp_http_client_cleanup(client);
+    free(body);
+    strlcpy(s_ha_command_note, error == ESP_OK && status == 200 ? "指令已发送" : "控制失败，请重试", sizeof(s_ha_command_note));
+    if (error == ESP_OK && status != 200) {
+        cJSON *result = cJSON_Parse(response.body);
+        if (result) {copy_json_string(result, "error", s_ha_command_note, sizeof(s_ha_command_note)); cJSON_Delete(result);}
+    }
+    heap_caps_free(response.body);
+    s_ha_result_seq++;
+}
+
 static void publish_offline_state(void)
 {
     if (s_have_snapshot) {
@@ -1010,6 +1121,7 @@ static void publish_offline_state(void)
         memset(&s_work_snapshot, 0, sizeof(s_work_snapshot));
         s_work_snapshot.status = CODEX_STATUS_OFFLINE;
     }
+    s_work_snapshot.ha_connected = false;
     app_state_publish(&s_work_snapshot);
 }
 
@@ -1026,6 +1138,8 @@ static void bridge_task(void *argument)
             pdMS_TO_TICKS(CONFIG_STATE_DISPLAY_POLL_SECONDS * 1000));
 
         if ((bits & WIFI_CONNECTED_BIT) || s_wifi_connected) {
+            ha_command_t ha_command;
+            while (s_ha_command_queue && xQueueReceive(s_ha_command_queue, &ha_command, 0) == pdTRUE) send_ha_command(&ha_command);
             bambu_command_t command;
             while (s_bambu_command_queue != NULL && xQueueReceive(s_bambu_command_queue, &command, 0) == pdTRUE) {
                 send_bambu_command(command);
@@ -1042,6 +1156,7 @@ static void bridge_task(void *argument)
                 if (s_bridge_failures < UINT8_MAX) s_bridge_failures++;
                 if (s_have_snapshot && s_bridge_failures < 12) {
                     strlcpy(s_bridge_note, "正在重连 · 保留上次数据", sizeof(s_bridge_note));
+                    s_last_snapshot.ha_connected = false;
                     app_state_publish(&s_last_snapshot);
                 } else {
                     s_bridge_online = false;
@@ -1106,9 +1221,10 @@ void connectivity_start(void)
     ESP_LOGI(TAG, "Preparing bridge data channel");
     s_events = xEventGroupCreate();
     s_bambu_command_queue = xQueueCreate(4, sizeof(bambu_command_t));
+    s_ha_command_queue = xQueueCreate(1, sizeof(ha_command_t));
     s_work_tasks = heap_caps_calloc(CODEX_TASK_DETAIL_MAX, sizeof(*s_work_tasks),
                                     MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    ESP_ERROR_CHECK((s_events == NULL || s_bambu_command_queue == NULL || s_work_tasks == NULL) ?
+    ESP_ERROR_CHECK((s_events == NULL || s_bambu_command_queue == NULL || s_ha_command_queue == NULL || s_work_tasks == NULL) ?
                     ESP_ERR_NO_MEM : ESP_OK);
     ESP_LOGI(TAG, "Bridge data buffers ready");
     setenv("TZ", CONFIG_STATE_DISPLAY_TIMEZONE, 1);
@@ -1171,4 +1287,15 @@ void connectivity_get_bridge_summary(char *buffer, size_t buffer_size)
 {
     (void)s_bridge_online;
     strlcpy(buffer, s_bridge_note, buffer_size);
+}
+
+bool connectivity_ha_command(uint8_t slot, uint32_t revision, const char *action, const char *value)
+{
+    if (s_ha_command_queue == NULL || slot >= HA_ENTITY_MAX || action == NULL || !s_wifi_connected) return false;
+    ha_command_t command = {.slot = slot, .revision = revision};
+    strlcpy(command.action, action, sizeof(command.action));
+    strlcpy(command.value, value ? value : "", sizeof(command.value));
+    if (xQueueSend(s_ha_command_queue, &command, 0) != pdTRUE) return false;
+    xEventGroupSetBits(s_events, REFRESH_REQUESTED_BIT);
+    return true;
 }
